@@ -13,6 +13,8 @@ from build123d import (
     Circle,
     Cone,
     Cylinder,
+    Face,
+    Location,
     Part,
     Plane,
     Pos,
@@ -22,11 +24,14 @@ from build123d import (
     SlotOverall,
     Sketch,
     Text,
+    Vector,
+    Wire,
     chamfer,
     export_step,
     export_stl,
     extrude,
     fillet,
+    loft,
 )
 
 import params as p
@@ -367,11 +372,349 @@ def fit_coupon() -> Part:
     return part
 
 
+# --- Interior: ramp and battery tray (#52) -------------------------------------
+# Frame: X across the box, Y along it (+Y = mechanism end), Z up, floor at Z = 0.
+# Every part is first built too wide, then clipped to the box interior, so the
+# side clearance follows the wall taper and the floor fillet on its own.
+
+X_WIDE = (-40.0, 120.0)  # Wider than the box at any height, before clipping.
+Z_LOW = 20.0  # Below every sloped part, for the bodies that get cut by the ramp surface.
+
+
+def box(x0: float, x1: float, y0: float, y1: float, z0: float, z1: float) -> Part:
+    """Axis-aligned box from its ranges."""
+    return Pos(x0, y0, z0) * Box(x1 - x0, y1 - y0, z1 - z0, align=(Align.MIN, Align.MIN, Align.MIN))
+
+
+def fuse(parts: list[Part]) -> Part:
+    """Union of a list of solids."""
+    out = parts[0]
+    for q in parts[1:]:
+        out += q
+    return out
+
+
+def section_y(y: float, pts: list[tuple[float, float]]) -> Face:
+    """Polygon (x, z) in the plane Y = y."""
+    return Face(Wire.make_polygon([Vector(x, y, z) for x, z in pts], close=True))
+
+
+def section_x(x: float, pts: list[tuple[float, float]]) -> Face:
+    """Polygon (y, z) in the plane X = x."""
+    return Face(Wire.make_polygon([Vector(x, y, z) for y, z in pts], close=True))
+
+
+def prism_y(pts: list[tuple[float, float]], y0: float, y1: float) -> Part:
+    return loft([section_y(y0, pts), section_y(y1, pts)], ruled=True)
+
+
+def prism_x(pts: list[tuple[float, float]], x0: float, x1: float) -> Part:
+    return loft([section_x(x0, pts), section_x(x1, pts)], ruled=True)
+
+
+def wall_x(z: float, side: int) -> float:
+    """Inner surface of the left (side -1) or right (side +1) box wall at height z."""
+    return p.BOX_CX + side * (p.BOX_W0 + p.BOX_TAPER * z) / 2
+
+
+def interior(side: float, end: float = 0.0) -> Part:
+    """Box interior shrunk by `side` on the side walls and `end` at the far end. The floor fillet
+    is cleared along its chord, which lies outside the real curve."""
+
+    def pt(z: float, s: int, inset: float) -> tuple[float, float]:
+        return (wall_x(z, s) - s * (side + inset), z)
+
+    pts = [
+        pt(0, -1, p.FLOOR_FILLET_W),
+        pt(0, 1, p.FLOOR_FILLET_W),
+        pt(p.FLOOR_FILLET_H, 1, 0),
+        pt(p.BOX_H, 1, 0),
+        pt(p.BOX_H, -1, 0),
+        pt(p.FLOOR_FILLET_H, -1, 0),
+    ]
+    return prism_y(pts, p.BOX_Y0 + end, p.BOX_Y1)
+
+
+def funnel_reach() -> float:
+    """Widest distance from the inlet band to a side of the sheet, in the funnel."""
+    z = p.INLET_Z + 10
+    left = p.INLET_X0 - (wall_x(z, -1) + p.RAMP_WALL_CLEARANCE)
+    right = (wall_x(z, 1) - p.RAMP_WALL_CLEARANCE) - p.INLET_X1
+    return max(left, right)
+
+
+def funnel_steepening() -> float:
+    """Extra slope of the inlet band inside the funnel. The sideways tilt grows along Y, which
+    lifts the sides as they come forward; without this, a strip some 30 mm from each wall would
+    be almost flat. With it, even the sheet edge at the wall keeps RAMP_SLOPE."""
+    return funnel_reach() * math.tan(math.radians(p.FUNNEL_SLOPE)) / p.FUNNEL_LENGTH
+
+
+def ramp_top(x: float, y: float) -> float:
+    """Height of the ramp's top surface: the main slope (steeper in the inlet band over the
+    funnel), plus the sideways funnel that grows from 0 to FUNNEL_SLOPE over FUNNEL_LENGTH,
+    measured from the edges of the inlet band."""
+    zc = p.INLET_Z + (p.INLET_Y - y) * math.tan(math.radians(p.RAMP_SLOPE))
+    zc += funnel_steepening() * min(p.FUNNEL_LENGTH, max(0.0, p.RAMP_FRONT_Y - y))
+    f = min(1.0, max(0.0, (y - (p.RAMP_FRONT_Y - p.FUNNEL_LENGTH)) / p.FUNNEL_LENGTH))
+    d = max(p.INLET_X0 - x, x - p.INLET_X1, 0.0)
+    return zc + f * d * math.tan(math.radians(p.FUNNEL_SLOPE))
+
+
+def ramp_thickness_z() -> float:
+    """Vertical sheet thickness giving at least RAMP_T square to the steepest part of the surface."""
+    tilt = math.atan(math.hypot(math.tan(math.radians(p.RAMP_SLOPE)), math.tan(math.radians(p.FUNNEL_SLOPE))))
+    return p.RAMP_T / math.cos(tilt)
+
+
+def ramp_layer(y0: float, y1: float, dz_top: float, dz_bottom: float | None = None, z_bottom: float = 0.0) -> Part:
+    """Solid under the ramp surface shifted by dz_top, down to the surface shifted by dz_bottom
+    (a sheet) or, without it, down to the flat z_bottom. The surface is linear in Y between
+    the stations, so a ruled loft through them is exact."""
+    stations = [y0]
+    stations += [y for y in (p.RAMP_FRONT_Y - p.FUNNEL_LENGTH, p.RAMP_FRONT_Y) if y0 < y < y1]
+    stations.append(y1)
+    xs = (X_WIDE[0], p.INLET_X0, p.INLET_X1, X_WIDE[1])
+
+    def sec(y: float) -> Face:
+        top = [(x, ramp_top(x, y) + dz_top) for x in xs]
+        if dz_bottom is None:
+            bottom = [(X_WIDE[1], z_bottom), (X_WIDE[0], z_bottom)]
+        else:
+            bottom = [(x, ramp_top(x, y) + dz_bottom) for x in reversed(xs)]
+        return section_y(y, top + bottom)
+
+    return loft([sec(y) for y in stations], ruled=True)
+
+
+def under_ramp(z_bottom: float) -> Part:
+    """Everything under the ramp surface (minus 0.3, so what is cut by it still fuses into the sheet)."""
+    return ramp_layer(p.BOX_Y0 - 5, p.INLET_Y + 5, -0.3, z_bottom=z_bottom)
+
+
+def drain_top(y: float) -> float:
+    """Top of the IN drain sheet: IN_DRAIN_Z under the IN axis, falling toward -Y at IN_DRAIN_SLOPE."""
+    return p.IN_DRAIN_Z + (y - p.IN_Y) * math.tan(math.radians(p.IN_DRAIN_SLOPE))
+
+
+def front_y_left() -> float:
+    """Top edge of the front wall left of the mechanism: far enough forward that the whole wall
+    stays out of the left wire chase."""
+    return p.MECH_Y0 - p.MECH_CLEARANCE - p.FRONT_T * math.sqrt(2)
+
+
+def front_wall(x0: float, x1: float, y_top: float) -> Part:
+    """45 deg wall rising from the sheet toward +Y, to the wing at MECH_TOP_Z on its edge y_top.
+    BBs that reach it roll back down; it also prints without support (ramp_b stands on end)."""
+    t = p.FRONT_T * math.sqrt(2)  # Its width along Y.
+    wing_top = p.MECH_TOP_Z + p.WING_T
+
+    def yf(z: float) -> float:
+        return y_top - (p.MECH_TOP_Z - z)
+
+    pts = [(yf(Z_LOW), Z_LOW), (y_top, p.MECH_TOP_Z), (y_top, wing_top), (yf(wing_top) + t, wing_top), (yf(Z_LOW) + t, Z_LOW)]
+    return prism_x(pts, x0, x1)
+
+
+def left_front_x1() -> float:
+    """Right end of the forward-set front wall on the left: past the left chase and past the
+    boss under the plate, which the wing lip must stay in front of."""
+    return max(p.MECH_X0, p.PLATE_BOSS[0][1] + 0.5)
+
+
+def wing_lip(x0: float, x1: float, y_top: float) -> Part:
+    """Lip on the wing's front edge, leaning forward at 45 deg up to WING_LIP_GAP under the plate.
+    With a full box the pile reaches the plate: without it, a layer of BBs would be pushed over
+    the wings and stranded there. Leaning forward keeps it clear of the boss under the plate,
+    and prints (ramp_b stands on end) as a 45 deg overhang."""
+    t = p.FRONT_T * math.sqrt(2)
+    top = p.PLATE_Z - p.WING_LIP_GAP
+    rise = top - p.MECH_TOP_Z
+    pts = [(y_top, p.MECH_TOP_Z), (y_top - rise, top), (y_top - rise + t, top), (y_top + t, p.MECH_TOP_Z)]
+    return prism_x(pts, x0, x1)
+
+
+def chute_wall(x0: float, x1: float) -> Part:
+    """Side wall of the 31 mm chute into the inlet, from the front wall to the mechanism face."""
+    pts = [(p.RAMP_FRONT_Y - (p.MECH_TOP_Z - Z_LOW), Z_LOW), (p.RAMP_FRONT_Y, p.MECH_TOP_Z),
+           (p.RAMP_FRONT_Y, p.MECH_TOP_Z + p.WING_T), (p.INLET_Y, p.MECH_TOP_Z + p.WING_T), (p.INLET_Y, Z_LOW)]
+    return prism_x(pts, x0, x1)
+
+
+def split_plane() -> Plane:
+    """Local frame at the split: origin on the sheet top on the split line, x' = X, y' down the
+    slope (toward the mechanism), z' square to the sheet, up. The split face is y' = 0."""
+    s = math.radians(p.RAMP_SLOPE)
+    origin = (0.0, p.RAMP_SPLIT_Y, ramp_top(p.INLET_X0, p.RAMP_SPLIT_Y))
+    return Plane(origin=origin, x_dir=(1, 0, 0), z_dir=(0, math.sin(s), math.cos(s)))
+
+
+def local_prism(pts: list[tuple[float, float]], x0: float, x1: float) -> Part:
+    """Prism along X from a (y', z') polygon in the split frame."""
+    return Location(split_plane()) * prism_x(pts, x0, x1)
+
+
+def joint_layout() -> dict[str, float]:
+    """Tongue extent across X: the sheet width at the split, minus a shoulder each side."""
+    z = ramp_top(p.INLET_X0, p.RAMP_SPLIT_Y)
+    x0 = wall_x(z - ramp_thickness_z(), -1) + p.RAMP_WALL_CLEARANCE + p.JOINT_SHOULDER
+    x1 = wall_x(z - ramp_thickness_z(), 1) - p.RAMP_WALL_CLEARANCE - p.JOINT_SHOULDER
+    return {"x0": x0, "x1": x1, "screw_y": p.JOINT_LAP / 2}
+
+
+def tongue(clearance: float = 0.0) -> Part:
+    """The tongue, flush with the top, 45 deg at its end. With a clearance: the pocket that takes it."""
+    k = joint_layout()
+    c, L, D = clearance, p.JOINT_LAP, p.JOINT_DEPTH
+    up = 1.0 if c else 0.0  # The pocket opens through the top.
+    pts = [(-1.0, up), (L + c * math.sqrt(2) + D + up, up), (L + c * math.sqrt(2) - c, -D - c), (-1.0, -D - c)]
+    return local_prism(pts, k["x0"] - c, k["x1"] + c)
+
+
+def split_screws(in_tongue: bool) -> Part:
+    """M3 holes square to the sheet: through the band below the pocket, or in the tongue with its nut trap."""
+    k = joint_layout()
+    r = p.M3_CLEARANCE / 2
+    holes = []
+    for x in p.SPLIT_SCREW_XS:
+        if in_tongue:
+            tip = -p.JOINT_BAND_T + p.SPLIT_SCREW_LEN + 0.5
+            z0 = -p.JOINT_DEPTH - 1
+            hole = Pos(x, k["screw_y"], z0) * Cylinder(r, tip - z0, align=(Align.CENTER, Align.CENTER, Align.MIN))
+            nut_h = p.M3_NUT_THICKNESS + p.NUT_TOLERANCE + 1
+            hole += Pos(x, k["screw_y"], z0) * extrude(RegularPolygon((p.M3_NUT_AF + p.NUT_TOLERANCE) / 2, 6, major_radius=False), nut_h)
+        else:
+            z0 = -p.JOINT_BAND_T - 2
+            hole = Pos(x, k["screw_y"], z0) * Cylinder(r, -p.JOINT_DEPTH + 1 - z0, align=(Align.CENTER, Align.CENTER, Align.MIN))
+        holes.append(hole)
+    return Location(split_plane()) * fuse(holes)
+
+
+def ramp() -> Part:
+    """The whole ramp, in the box frame, before the split."""
+    global _RAMP
+    if _RAMP is not None:
+        return _RAMP
+    tz = ramp_thickness_z()
+    y_far = p.BOX_Y0 + p.RAMP_END_CLEARANCE
+    under = under_ramp(Z_LOW)
+    # Sheet, stopped short of the wire chases each side of the mechanism.
+    part = ramp_layer(y_far, p.INLET_Y, 0.0, dz_bottom=-tz)
+    cut_y = p.MECH_Y0 - p.MECH_CLEARANCE
+    part -= box(X_WIDE[0], p.MECH_X0, cut_y, 50, 0, 100) + box(p.MECH_X1, X_WIDE[1], cut_y, 50, 0, 100)
+    # Front walls up to the wings, either side of the chute, and the chute's side walls.
+    xl = left_front_x1()
+    walls = front_wall(X_WIDE[0], xl, front_y_left())
+    walls += front_wall(xl, p.INLET_X0 - p.CHUTE_WALL, p.RAMP_FRONT_Y)
+    walls += front_wall(p.INLET_X1 + p.CHUTE_WALL, p.MECH_X1, p.RAMP_FRONT_Y)
+    walls += chute_wall(p.INLET_X0 - p.CHUTE_WALL, p.INLET_X0) + chute_wall(p.INLET_X1, p.INLET_X1 + p.CHUTE_WALL)
+    # IN drain: one plane at IN_DRAIN_SLOPE from behind the IN axis down into the sheet, over the
+    # right chase, and a web closing its side in front of the mechanism.
+    td = p.RAMP_T / math.cos(math.radians(p.IN_DRAIN_SLOPE))
+    yb, yl = p.IN_DRAIN_BACK_Y, -80.0
+    walls += prism_x([(yl, drain_top(yl)), (yb, drain_top(yb)), (yb, drain_top(yb) - td), (yl, drain_top(yl) - td)],
+                     p.MECH_X1 + p.MECH_CLEARANCE, X_WIDE[1])
+    y_web = p.MECH_Y0
+    walls += prism_x([(yl, drain_top(yl)), (y_web, drain_top(y_web)), (y_web, Z_LOW), (yl, Z_LOW)],
+                     p.MECH_X1, p.MECH_X1 + p.MECH_CLEARANCE + p.IN_DRAIN_WEB)
+    part += walls - under
+    # Wings on the mechanism top: OUT barrel hole, open wire pass over the left chase.
+    wing_z = (p.MECH_TOP_Z, p.MECH_TOP_Z + p.WING_T)
+    wing = box(X_WIDE[0], p.MECH_X1 + p.MECH_CLEARANCE, p.RAMP_FRONT_Y, p.WING_Y1, *wing_z)
+    wing += box(X_WIDE[0], xl, front_y_left(), p.RAMP_FRONT_Y + 1, *wing_z)
+    wing -= Pos(p.OUT_X, p.OUT_Y, p.MECH_TOP_Z) * Cylinder(p.OUT_HOLE_D / 2, 20)
+    wing -= box(X_WIDE[0], p.WIRE_PASS_X1, p.WIRE_PASS_Y0, 50, 0, 100)
+    part += wing
+    part += wing_lip(X_WIDE[0], xl, front_y_left()) + wing_lip(xl, p.MECH_X1 + p.MECH_CLEARANCE, p.RAMP_FRONT_Y)
+    # Under the sheet: the leg on the floor, the ribs and the band at the split.
+    support = box(X_WIDE[0], X_WIDE[1], y_far, y_far + p.LEG_T, 0, 100)
+    ribs = fuse([box(x - p.RIB_T / 2, x + p.RIB_T / 2, y_far, p.RAMP_FRONT_Y - 1, p.RIB_BOTTOM_Z, 100)
+                 for x in p.RIB_XS])
+    support += ribs & ramp_layer(y_far - 1, p.INLET_Y, 50.0, dz_bottom=-p.RIB_DEPTH)
+    band = local_prism([(-p.JOINT_BAND_LEN, 0), (p.JOINT_BAND_LEN, 0), (p.JOINT_BAND_LEN, -p.JOINT_BAND_T),
+                        (-p.JOINT_BAND_LEN, -p.JOINT_BAND_T)], X_WIDE[0], X_WIDE[1])
+    support += band & box(X_WIDE[0], X_WIDE[1], -300, 100, p.RIB_BOTTOM_Z, 100)
+    part += support & under_ramp(0.0)
+    _RAMP = part & interior(p.RAMP_WALL_CLEARANCE, p.RAMP_END_CLEARANCE)
+    return _RAMP
+
+
+_RAMP = None
+
+
+def split_half(side: int) -> Part:
+    """Half-space y' <= 0 (side -1, ramp_a) or y' >= 0 (side +1, ramp_b) in the split frame."""
+    pts = [(0, -200), (side * 400, -200), (side * 400, 200), (0, 200)]
+    return local_prism(pts, X_WIDE[0], X_WIDE[1])
+
+
+def ramp_a() -> Part:
+    """Far piece: the sheet from the far end to the split, the leg, and the tongue."""
+    tongue_part = tongue() & interior(p.RAMP_WALL_CLEARANCE)
+    return (ramp() & split_half(-1)) + tongue_part - split_screws(in_tongue=True)
+
+
+def ramp_b() -> Part:
+    """Near piece: funnel, chute, front walls, wings and IN drain, with the pocket for the tongue."""
+    return (ramp() & split_half(1)) - tongue(p.JOINT_CLEARANCE) - split_screws(in_tongue=False)
+
+
+def print_pose(part: Part, angle: float) -> Part:
+    """Rotate about X by `angle`, then sit on the bed (Z = 0) centred on the origin.
+    ramp_a: 180 + slope puts its top face (the BB surface) on the bed.
+    ramp_b: 90 + slope stands it on its split face."""
+    r = Rot(angle, 0, 0) * part
+    bb = r.bounding_box()
+    return Pos(-(bb.min.X + bb.max.X) / 2, -(bb.min.Y + bb.max.Y) / 2, -bb.min.Z) * r
+
+
+def strap_stations() -> list[tuple[float, float]]:
+    """(Y of the strap, X of its left slot) for every strap station."""
+    yc = (p.BAY_Y[0] + p.BAY_Y[1]) / 2
+    return [(yc - p.STRAP_PITCH / 2, p.STRAP_X_LEFT), (yc + p.STRAP_PITCH / 2, p.STRAP_X_LEFT),
+            (p.LANE_STRAP_Y, p.LANE_STRAP_X)]
+
+
+def battery_tray() -> Part:
+    """Floor tray for the battery: a floor on cross runners (the strap passes under it), the bay,
+    the lane past the servo, the lead strip to the left chase, low lips and the strap slots.
+    Printed as it sits, runners on the bed."""
+    rects = [(p.BAY_X, p.BAY_Y), (p.LANE_X, p.LANE_Y), (p.LEAD_X, p.LEAD_Y)]
+    floor_z = (p.TRAY_RUNNER_H, p.TRAY_FLOOR_Z)
+    footprint = fuse([box(*xr, *yr, 0, p.TRAY_FLOOR_Z) for xr, yr in rects])
+    part = footprint & box(X_WIDE[0], X_WIDE[1], -300, 100, *floor_z)
+    # Cross runners, skipped where a strap passes under the floor.
+    stations = strap_stations()
+    keep = p.STRAP_SLOT[1] / 2 + p.TRAY_RUNNER_W
+    runners = []
+    y = p.BAY_Y[0] + p.TRAY_RUNNER_W / 2
+    while y <= p.LANE_Y[1] - p.TRAY_RUNNER_W / 2:
+        if all(abs(y - ys) > keep for ys, _ in stations):
+            runners.append(box(X_WIDE[0], X_WIDE[1], y - p.TRAY_RUNNER_W / 2, y + p.TRAY_RUNNER_W / 2, 0, p.TRAY_RUNNER_H + 0.1))
+        y += p.TRAY_RUNNER_PITCH
+    runners.append(box(X_WIDE[0], X_WIDE[1], p.LANE_Y[1] - p.TRAY_RUNNER_W, p.LANE_Y[1], 0, p.TRAY_RUNNER_H + 0.1))
+    part += fuse(runners) & footprint
+    # Lips: back of the bay, front of the bay (left of the lane, right of the lead strip), lead ridge.
+    lip_z = (p.TRAY_RUNNER_H, p.TRAY_FLOOR_Z + p.TRAY_LIP_H)
+    part += box(X_WIDE[0], X_WIDE[1], p.BAY_Y[0], p.BAY_Y[0] + p.TRAY_LIP_T, *lip_z)
+    part += box(p.LEAD_X[1] - p.TRAY_LIP_T, p.LANE_X[0], p.BAY_Y[1] - p.TRAY_LIP_T, p.BAY_Y[1], *lip_z)
+    part += box(p.LEAD_X[1] - p.TRAY_LIP_T, p.LEAD_X[1], p.BAY_Y[1] - p.TRAY_LIP_T, p.LEAD_Y[1] - 1, *lip_z)
+    # Strap slots: a closed slot on the left, a notch open to the wall on the right.
+    sw, sl = p.STRAP_SLOT
+    for ys, xs in stations:
+        part -= box(xs - sw / 2, xs + sw / 2, ys - sl / 2, ys + sl / 2, -1, 20)
+        part -= box(p.STRAP_X_RIGHT - sw / 2, X_WIDE[1], ys - sl / 2, ys + sl / 2, -1, 20)
+    return part & interior(p.TRAY_WALL_CLEARANCE)
+
+
 PARTS = {
     "test_ring": test_ring,
     "ir_collar": ir_collar,
     "fit_coupon": fit_coupon,
     "encoder_knob": encoder_knob,
+    "ramp_a": lambda: print_pose(ramp_a(), 180 + p.RAMP_SLOPE),
+    "ramp_b": lambda: print_pose(ramp_b(), 90 + p.RAMP_SLOPE),
+    "battery_tray": battery_tray,
 }
 
 
